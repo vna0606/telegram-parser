@@ -1,44 +1,63 @@
 from flask import Flask, request, jsonify
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import User, Channel, Chat
 from datetime import datetime, timedelta
 import os
 import asyncio
 import logging
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Настройки из переменных окружения
+# Получаем данные из переменных окружения
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
-PHONE = os.getenv('PHONE', '')
-SESSION_NAME = os.getenv('SESSION_NAME', 'parser_session')
+SESSION_STRING = os.getenv('SESSION_STRING', '')
 
-# Глобальный клиент
 client = None
 client_lock = asyncio.Lock()
 
 async def get_client():
-    """
-    Получает или создает подключенного клиента
-    """
+    """Получает или создает подключенного клиента"""
     global client
     
     async with client_lock:
         if client is None:
-            logger.info("Создание нового клиента...")
-            client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-            await client.connect()
+            logger.info("Инициализация Telegram клиента...")
             
-            if not await client.is_user_authorized():
-                logger.error("Клиент не авторизован!")
-                raise Exception("Telegram клиент не авторизован. Требуется первичная настройка.")
+            if not SESSION_STRING:
+                raise Exception("SESSION_STRING не найдена в переменных окружения")
             
-            logger.info("Клиент успешно подключен")
+            if not API_ID or API_ID == 0:
+                raise Exception("API_ID не найден в переменных окружения")
+            
+            if not API_HASH:
+                raise Exception("API_HASH не найден в переменных окружения")
+            
+            try:
+                client = TelegramClient(
+                    StringSession(SESSION_STRING), 
+                    API_ID, 
+                    API_HASH
+                )
+                
+                await client.connect()
+                
+                if not await client.is_user_authorized():
+                    raise Exception("Сессия недействительна. Требуется получить новую SESSION_STRING")
+                
+                me = await client.get_me()
+                logger.info(f"✅ Клиент подключен: {me.first_name} (@{me.username or 'без username'})")
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка подключения клиента: {e}")
+                raise
         
         elif not client.is_connected():
             logger.info("Переподключение клиента...")
@@ -47,9 +66,7 @@ async def get_client():
         return client
 
 async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
-    """
-    Парсит сообщения из чата за указанный период
-    """
+    """Парсит сообщения из чата за указанный период"""
     try:
         tg_client = await get_client()
         
@@ -57,35 +74,33 @@ async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
         if date_from:
             try:
                 offset_date = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
-            except:
+            except Exception as e:
+                logger.warning(f"Не удалось разобрать дату {date_from}: {e}")
                 offset_date = datetime.now() - timedelta(days=7)
         elif days_back:
             offset_date = datetime.now() - timedelta(days=int(days_back))
         else:
             offset_date = None
         
-        logger.info(f"Парсинг канала {channel_id}, лимит: {limit}, дата с: {offset_date}")
+        logger.info(f"📥 Парсинг канала {channel_id}")
+        logger.info(f"   Лимит: {limit}, Период с: {offset_date}")
         
         messages = []
+        channel_id_int = int(channel_id)
         
-        # Преобразуем ID в integer если нужно
-        try:
-            channel_id_int = int(channel_id)
-        except:
-            channel_id_int = channel_id
+        message_count = 0
         
         # Получаем сообщения
-        message_count = 0
-        async for message in tg_client.iter_messages(
-            channel_id_int, 
-            limit=limit,
-            reverse=False  # От новых к старым
-        ):
+        async for message in tg_client.iter_messages(channel_id_int, limit=limit):
             message_count += 1
             
-            # Проверяем дату если указана
+            # Проверяем дату
             if offset_date and message.date:
-                if message.date.replace(tzinfo=None) < offset_date.replace(tzinfo=None):
+                msg_date = message.date.replace(tzinfo=None)
+                offset_date_naive = offset_date.replace(tzinfo=None)
+                
+                if msg_date < offset_date_naive:
+                    logger.info(f"   Достигнута дата {msg_date}, останавливаемся")
                     break
             
             # Получаем информацию об отправителе
@@ -100,7 +115,8 @@ async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
                             sender_name += f" (@{message.sender.username})"
                     elif isinstance(message.sender, (Channel, Chat)):
                         sender_name = message.sender.title or ""
-            except:
+            except Exception as e:
+                logger.warning(f"Не удалось получить отправителя: {e}")
                 sender_name = "Unknown"
             
             # Формируем данные сообщения
@@ -109,7 +125,6 @@ async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
                 'date': message.date.strftime('%Y-%m-%d %H:%M:%S') if message.date else '',
                 'text': message.message or "",
                 'sender': sender_name,
-                'from_user': sender_name,
                 'views': message.views or 0,
                 'forwards': message.forwards or 0,
                 'has_media': bool(message.media),
@@ -118,15 +133,16 @@ async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
             
             messages.append(msg_data)
         
-        logger.info(f"Собрано {len(messages)} сообщений из {message_count} просмотренных")
+        logger.info(f"✅ Собрано {len(messages)} сообщений (просмотрено {message_count})")
         return messages
     
     except Exception as e:
-        logger.error(f"Ошибка при парсинге: {str(e)}", exc_info=True)
+        logger.error(f"❌ Ошибка при парсинге: {str(e)}", exc_info=True)
         raise Exception(f"Ошибка при парсинге: {str(e)}")
 
 @app.route('/parse', methods=['POST'])
 def parse():
+    """Endpoint для парсинга канала"""
     try:
         data = request.get_json()
         
@@ -141,9 +157,9 @@ def parse():
         if not channel:
             return jsonify({'error': 'Не указан channel'}), 400
         
-        logger.info(f"Получен запрос: channel={channel}, limit={limit}, days_back={days_back}")
+        logger.info(f"📨 Получен запрос: channel={channel}, limit={limit}, days_back={days_back}")
         
-        # Запускаем парсинг
+        # Создаем новый event loop для каждого запроса
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -163,7 +179,7 @@ def parse():
         })
     
     except Exception as e:
-        logger.error(f"Ошибка в /parse: {str(e)}", exc_info=True)
+        logger.error(f"❌ Ошибка в /parse: {str(e)}")
         return jsonify({
             'error': str(e),
             'details': 'Проверьте правильность ID чата и доступ к нему'
@@ -171,44 +187,50 @@ def parse():
 
 @app.route('/health', methods=['GET'])
 def health():
+    """Проверка работоспособности сервера"""
     return jsonify({
         'status': 'OK',
         'message': 'Telegram Parser Server is running',
-        'api_id_set': bool(API_ID),
-        'api_hash_set': bool(API_HASH),
-        'phone_set': bool(PHONE)
+        'config': {
+            'api_id_set': bool(API_ID and API_ID != 0),
+            'api_hash_set': bool(API_HASH),
+            'session_set': bool(SESSION_STRING)
+        }
     })
 
-@app.route('/status', methods=['GET'])
-async def status():
-    """
-    Проверка статуса подключения
-    """
+@app.route('/test', methods=['GET'])
+def test():
+    """Тестовый endpoint для проверки подключения"""
     try:
-        tg_client = await get_client()
-        is_connected = tg_client.is_connected()
-        is_authorized = await tg_client.is_user_authorized()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        me = None
-        if is_authorized:
+        async def check_connection():
+            tg_client = await get_client()
             me = await tg_client.get_me()
+            return {
+                'connected': True,
+                'user': {
+                    'id': me.id,
+                    'name': f"{me.first_name} {me.last_name or ''}",
+                    'username': me.username,
+                    'phone': me.phone
+                }
+            }
         
-        return jsonify({
-            'connected': is_connected,
-            'authorized': is_authorized,
-            'user': {
-                'id': me.id if me else None,
-                'username': me.username if me else None,
-                'phone': me.phone if me else None
-            } if me else None
-        })
+        try:
+            result = loop.run_until_complete(check_connection())
+            return jsonify(result)
+        finally:
+            loop.close()
+    
     except Exception as e:
         return jsonify({
-            'error': str(e),
             'connected': False,
-            'authorized': False
+            'error': str(e)
         }), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
+    logger.info(f"🚀 Запуск сервера на порту {port}")
     app.run(host='0.0.0.0', port=port)
