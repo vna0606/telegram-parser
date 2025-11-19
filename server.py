@@ -83,16 +83,43 @@ async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
         else:
             offset_date = None
         
-        logger.info(f"📥 Парсинг канала {channel_id}")
+        # Обрабатываем разные форматы channel_id
+        channel_input = str(channel_id).strip()
+        
+        # Убираем https://t.me/ если есть
+        if 't.me/' in channel_input:
+            channel_input = channel_input.split('t.me/')[-1]
+        
+        # Убираем лишние символы
+        channel_input = channel_input.replace('https://', '').replace('http://', '')
+        
+        # Пробуем преобразовать в int (если это ID)
+        try:
+            channel_entity = int(channel_input)
+            logger.info(f"📥 Парсинг канала по ID: {channel_entity}")
+        except ValueError:
+            # Это username
+            # Убираем @ если есть
+            if channel_input.startswith('@'):
+                channel_input = channel_input[1:]
+            channel_entity = channel_input
+            logger.info(f"📥 Парсинг канала по username: @{channel_entity}")
+        
         logger.info(f"   Лимит: {limit}, Период с: {offset_date}")
         
-        messages = []
-        channel_id_int = int(channel_id)
+        # Получаем информацию о канале
+        try:
+            entity = await tg_client.get_entity(channel_entity)
+            logger.info(f"   Канал найден: {getattr(entity, 'title', getattr(entity, 'first_name', 'Unknown'))}")
+        except Exception as e:
+            logger.error(f"   Ошибка получения канала: {e}")
+            raise Exception(f"Канал не найден или нет доступа: {channel_input}")
         
+        messages = []
         message_count = 0
         
         # Получаем сообщения
-        async for message in tg_client.iter_messages(channel_id_int, limit=limit):
+        async for message in tg_client.iter_messages(channel_entity, limit=limit):
             message_count += 1
             
             # Проверяем дату
