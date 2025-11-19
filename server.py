@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 import asyncio
 import logging
+import threading
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,6 +141,22 @@ async def parse_messages(channel_id, limit=100, days_back=None, date_from=None):
         logger.error(f"❌ Ошибка при парсинге: {str(e)}", exc_info=True)
         raise Exception(f"Ошибка при парсинге: {str(e)}")
 
+def run_async(coro):
+    """Запускает async функцию в синхронном контексте"""
+    try:
+        # Пробуем получить текущий event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            # Если закрыт - создаем новый
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        # Если loop нет - создаем новый
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(coro)
+
 @app.route('/parse', methods=['POST'])
 def parse():
     """Endpoint для парсинга канала"""
@@ -159,16 +176,8 @@ def parse():
         
         logger.info(f"📨 Получен запрос: channel={channel}, limit={limit}, days_back={days_back}")
         
-        # Создаем новый event loop для каждого запроса
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            messages = loop.run_until_complete(
-                parse_messages(channel, limit, days_back, date_from)
-            )
-        finally:
-            loop.close()
+        # Запускаем парсинг через run_async
+        messages = run_async(parse_messages(channel, limit, days_back, date_from))
         
         return jsonify({
             'success': True,
@@ -202,9 +211,6 @@ def health():
 def test():
     """Тестовый endpoint для проверки подключения"""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
         async def check_connection():
             tg_client = await get_client()
             me = await tg_client.get_me()
@@ -212,17 +218,14 @@ def test():
                 'connected': True,
                 'user': {
                     'id': me.id,
-                    'name': f"{me.first_name} {me.last_name or ''}",
+                    'name': f"{me.first_name} {me.last_name or ''}".strip(),
                     'username': me.username,
                     'phone': me.phone
                 }
             }
         
-        try:
-            result = loop.run_until_complete(check_connection())
-            return jsonify(result)
-        finally:
-            loop.close()
+        result = run_async(check_connection())
+        return jsonify(result)
     
     except Exception as e:
         return jsonify({
